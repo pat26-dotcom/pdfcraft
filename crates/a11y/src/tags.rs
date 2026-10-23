@@ -254,38 +254,53 @@ fn table_attribute(doc: &Document, d: &Dict, key: &[u8]) -> Option<Object> {
     attribute_entries(doc, d).0.iter().map(|(o, _)| doc.resolve(o)).filter(|o| is_table_attributes(o)).find_map(|o| o.as_dict()?.get(key).cloned())
 }
 
-/// Set (or with `None` remove) `key` in the Table attribute object of `object`'s `/A` entry,
-/// adding one when there is none. The edited object is written into the tag's own `/A`, so an
-/// attribute object other tags share keeps its value for them; one left with nothing but its
-/// owner goes, and so does an `/A` left empty.
+/// Set `key` in the Table attribute object of `object`'s `/A` entry that holds it (else the first
+/// one, else a new one), or with `None` remove it from every Table attribute object that holds it.
+/// An edited object is written into the tag's own `/A`, so an attribute object other tags share
+/// keeps its value for them; one left with nothing but its owner goes, and so does an `/A` left
+/// empty.
 fn set_table_attribute(doc: &mut Document, object: ObjRef, key: &[u8], value: Option<Object>) -> Result<(), TagError> {
     let dict = doc.get(object).as_dict().cloned().ok_or(TagError::NotATag(object))?;
-    let (mut entries, array) = attribute_entries(doc, &dict);
-    match entries.iter().position(|(o, _)| is_table_attributes(&doc.resolve(o))) {
-        Some(i) => {
-            let Some(entry) = entries.get_mut(i) else { return Ok(()) };
-            let mut attributes = doc.resolve(&entry.0).as_dict().cloned().unwrap_or_default();
-            match value {
-                Some(v) => attributes.set(key.to_vec(), v),
-                None => {
-                    attributes.remove(key);
+    let (entries, array) = attribute_entries(doc, &dict);
+    // Each entry with its Table attributes (resolved), when it is a Table attribute object.
+    let mut entries: Vec<(Object, Option<Object>, Option<Dict>)> = entries
+        .into_iter()
+        .map(|(o, r)| {
+            let table = Some(doc.resolve(&o)).filter(|a| is_table_attributes(a)).and_then(|a| a.as_dict().cloned());
+            (o, r, table)
+        })
+        .collect();
+    let holding = |e: &(Object, Option<Object>, Option<Dict>)| e.2.as_ref().is_some_and(|d| d.contains(key));
+    match value {
+        Some(v) => match entries.iter().position(holding).or_else(|| entries.iter().position(|e| e.2.is_some())) {
+            Some(i) => {
+                if let Some((o, _, Some(attributes))) = entries.get_mut(i) {
+                    attributes.set(key.to_vec(), v);
+                    *o = Object::Dict(attributes.clone());
                 }
             }
-            if attributes.iter().all(|(k, _)| k.as_slice() == b"O") {
-                entries.remove(i);
-            } else {
-                entry.0 = Object::Dict(attributes);
+            None => {
+                let mut attributes = Dict::new();
+                attributes.set(b"O".to_vec(), Object::name("Table"));
+                attributes.set(key.to_vec(), v);
+                entries.push((Object::Dict(attributes), None, None));
             }
-        }
+        },
         None => {
-            // Nothing to clear.
-            let Some(v) = value else { return Ok(()) };
-            let mut attributes = Dict::new();
-            attributes.set(b"O".to_vec(), Object::name("Table"));
-            attributes.set(key.to_vec(), v);
-            entries.push((Object::Dict(attributes), None));
+            if !entries.iter().any(holding) {
+                // Nothing to clear.
+                return Ok(());
+            }
+            for (o, _, table) in &mut entries {
+                if let Some(attributes) = table.as_mut().filter(|a| a.contains(key)) {
+                    attributes.remove(key);
+                    *o = Object::Dict(attributes.clone());
+                }
+            }
+            entries.retain(|(_, _, table)| !table.as_ref().is_some_and(|a| a.iter().all(|(k, _)| k.as_slice() == b"O")));
         }
     }
+    let entries: Vec<(Object, Option<Object>)> = entries.into_iter().map(|(o, r, _)| (o, r)).collect();
     doc.update_dict(object, |d| match entries.as_slice() {
         [] => {
             d.remove(b"A");
